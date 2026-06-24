@@ -12,7 +12,6 @@
 import asyncio
 import os
 import sys
-import time
 from pathlib import Path
 
 import click
@@ -55,74 +54,6 @@ BANNER = f"""
 │                                                          │
 ╰──────────────────────────────────────────────────────────╯"""
 
-# ── Loading Animation ──
-
-_LOADING_LOGO = [
-    "",
-    "        _.-\"\"\"-._          ",
-    "      .'         '.        ",
-    "     /   -     -   \\       ",
-    "    |       ^       |       ",
-    "    |     \\___/     |       ",
-    "     \\             /        ",
-    "      '.         .'        ",
-    "        `-...--'`          ",
-]
-
-_LOADING_SPINNERS = ["-", "\\", "|", "/"]
-
-
-def _enable_ansi_on_windows():
-    """Windows 10+ 启用 ANSI 转义序列支持。"""
-    if sys.platform == "win32":
-        import ctypes
-        kernel32 = ctypes.windll.kernel32
-        kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 0x0007)
-
-
-def show_loading(duration: float = 1.5):
-    """显示动态加载动画。
-
-    原理：
-    1. 隐藏光标 (ANSI \\033[?25l)
-    2. 每帧用 \\033[H 回到屏幕左上角覆盖绘制
-    3. 用 \\033[K 清除行尾残留字符
-    4. time.sleep() 控制帧率
-    5. 结束后清屏、恢复光标 (\\033[?25h)
-    """
-    _enable_ansi_on_windows()
-
-    HIDE_CURSOR = "\033[?25l"
-    SHOW_CURSOR = "\033[?25h"
-    CLEAR = "\033[2J\033[H"
-    MOVE_HOME = "\033[H"
-    CLR_EOL = "\033[K"
-
-    sys.stdout.write(HIDE_CURSOR)
-    sys.stdout.flush()
-
-    dots_cycle = [".  ", ".. ", "..."]
-    start = time.time()
-    idx = 0
-
-    while time.time() - start < duration:
-        sys.stdout.write(MOVE_HOME)
-        for line in _LOADING_LOGO:
-            sys.stdout.write(f"  {line}{CLR_EOL}\n")
-        spinner = _LOADING_SPINNERS[idx % len(_LOADING_SPINNERS)]
-        dots = dots_cycle[idx % len(dots_cycle)]
-        sys.stdout.write(f"\n     MiniCode v{__version__}{CLR_EOL}\n")
-        sys.stdout.write(f"\n   {spinner} 加载中{dots}{CLR_EOL}\n")
-        sys.stdout.flush()
-        idx += 1
-        time.sleep(0.2)
-
-    # 清屏并恢复光标
-    sys.stdout.write(CLEAR)
-    sys.stdout.write(SHOW_CURSOR)
-    sys.stdout.flush()
-
-
 def get_repo_info() -> dict:
     """获取当前仓库信息。"""
     cwd = Path.cwd()
@@ -149,7 +80,7 @@ async def stream_events(task: str, loop: QueryLoop, display: LiveDisplay):
                 approval_event = detail.get("_approval_event")
                 approval_result = detail.get("_approval_result")
                 if approval_event is not None and approval_result is not None:
-                    choice = click.prompt("  Approve? [y/n]", type=str, default="n").strip().lower()
+                    choice = display.prompt("  Approve? [y/n] ").strip().lower()
                     if choice == "y":
                         approval_result["approved"] = True
                     approval_event.set()
@@ -165,7 +96,7 @@ async def repl_loop(loop: QueryLoop, display: LiveDisplay):
     """交互式 REPL 循环。"""
     while True:
         try:
-            user_input = click.prompt("", prompt_suffix="> ").strip()
+            user_input = display.prompt("> ")
         except (KeyboardInterrupt, EOFError):
             display.print("\n  再见")
             break
@@ -273,14 +204,9 @@ def main(
         with LiveDisplay(model=model_display, verbose=verbose, quiet=quiet) as display:
             # 显示 Banner
             if not quiet:
-                show_loading(duration=1.0)
                 info = get_repo_info()
                 info["model"] = model_display
-                try:
-                    display.print(BANNER.format(**info))
-                except UnicodeEncodeError:
-                    display.print(BANNER.format(**info)
-                                  .encode("ascii", errors="replace").decode("ascii"))
+                display.show_banner(BANNER.format(**info))
 
             try:
                 if task:
