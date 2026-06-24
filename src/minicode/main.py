@@ -37,6 +37,7 @@ from minicode.llm.client import DeepSeekLLMClient, MockLLMClient
 from minicode.memory.store import FileMemoryStore
 from minicode.context.builder import ContextBuilder
 from minicode.security.classifier import build_default_classifier, MockSecurityClassifier
+from minicode.tui import LiveDisplay
 
 
 # ── Banner ──
@@ -137,116 +138,59 @@ def get_repo_info() -> dict:
 # ── Event Consumer ──
 
 
-async def stream_events(task: str, loop: QueryLoop):
-    """消费 AgentEvent 流并渲染到终端。
-
-    Args:
-        task: 用户任务
-        loop: 已初始化的 QueryLoop
-    """
+async def stream_events(task: str, loop: QueryLoop, display: LiveDisplay):
+    """消费 AgentEvent 流并通过 LiveDisplay 渲染到终端。"""
     try:
         async for event in loop.run(task):
-            _render_event(event)
+            display.render(event)
+            # 审批事件需要交互
+            if event.type == "need_approval":
+                detail = event.detail or {}
+                approval_event = detail.get("_approval_event")
+                approval_result = detail.get("_approval_result")
+                if approval_event is not None and approval_result is not None:
+                    choice = click.prompt("  Approve? [y/n]", type=str, default="n").strip().lower()
+                    if choice == "y":
+                        approval_result["approved"] = True
+                    approval_event.set()
     except asyncio.CancelledError:
-        click.echo("\n  中断")
-        click.echo("  [c] 继续等待   [r] 重新规划   [a] 放弃任务")
-
-
-def _safe_echo(text: str = "", **kwargs):
-    """click.echo 的编码安全包装。"""
-    try:
-        click.echo(text, **kwargs)
-    except UnicodeEncodeError:
-        # Windows GBK 终端不支持 emoji，降级 ASCII
-        safe = text.encode("ascii", errors="replace").decode("ascii")
-        click.echo(safe, **kwargs)
-
-
-def _render_event(event: AgentEvent):
-    """将单个 AgentEvent 渲染为一行终端输出。"""
-    icon = event.icon
-    msg = event.message
-
-    if event.type == "thinking":
-        detail = event.detail or {}
-        reasoning = detail.get("reasoning", "")
-        if reasoning and detail.get("phase") == "plan_complete":
-            _safe_echo(f"  {icon} {msg}")
-            _safe_echo(f"  [reason] {reasoning}")
-        else:
-            _safe_echo(f"  {icon} {msg}")
-    elif event.type == "tool_result":
-        _safe_echo(f"{msg}")
-    elif event.type == "need_approval":
-        detail = event.detail or {}
-        approval_event = detail.get("_approval_event")
-        approval_result = detail.get("_approval_result")
-
-        _safe_echo(f"\n  {icon} High Risk Action")
-        _safe_echo(f"  Tool:  {detail.get('tool', '?')}")
-        _safe_echo(f"  Risk:  {detail.get('risk', '?')}")
-        if detail.get("description"):
-            _safe_echo(f"  Desc:  {detail.get('description')}")
-
-        if approval_event is not None and approval_result is not None:
-            choice = click.prompt("  Approve? [y/n]", type=str, default="n").strip().lower()
-            if choice == "y":
-                approval_result["approved"] = True
-            approval_event.set()
-        else:
-            _safe_echo("  Approve? [y/n] > y (auto)")
-    elif event.type == "done":
-        _safe_echo(f"\n  {icon} {msg}")
-        detail = event.detail or {}
-        summary = detail.get("summary", "")
-        if summary:
-            _safe_echo(f"\n{summary}")
-    elif event.type == "reflection":
-        _safe_echo(f"  {icon} {msg}")
-    else:
-        _safe_echo(f"  {icon} {msg}")
+        display.print("\n  中断")
+        display.print("  [c] 继续等待   [r] 重新规划   [a] 放弃任务")
 
 
 # ── REPL ──
 
 
-async def repl_loop(loop: QueryLoop):
-    """交互式 REPL 循环。
-
-    读取用户输入 → 执行 QueryLoop → 渲染事件 → 回到提示符。
-    """
+async def repl_loop(loop: QueryLoop, display: LiveDisplay):
+    """交互式 REPL 循环。"""
     while True:
         try:
             user_input = click.prompt("", prompt_suffix="> ").strip()
         except (KeyboardInterrupt, EOFError):
-            click.echo("\n  再见")
+            display.print("\n  再见")
             break
 
         if not user_input:
             continue
 
-        # 元命令
         if user_input.startswith("/"):
-            _handle_meta_command(user_input, loop)
+            _handle_meta_command(user_input, loop, display)
             continue
 
-        # 正常任务
-        click.echo()  # 空行分隔
-        await stream_events(user_input, loop)
-        click.echo()  # 空行后回到提示符
+        await stream_events(user_input, loop, display)
 
 
-def _handle_meta_command(cmd: str, loop: QueryLoop):
+def _handle_meta_command(cmd: str, loop: QueryLoop, display: LiveDisplay):
     """处理 / 开头的元命令。"""
     parts = cmd.split(maxsplit=1)
     command = parts[0].lower()
     arg = parts[1] if len(parts) > 1 else ""
 
     if command in ("/exit", "/quit"):
-        click.echo("  再见")
+        display.print("  再见")
         sys.exit(0)
     elif command == "/help":
-        click.echo("""
+        display.print("""
   元命令:
   /help            帮助
   /skills          列出可用 Skill
@@ -258,33 +202,33 @@ def _handle_meta_command(cmd: str, loop: QueryLoop):
         """)
     elif command == "/skills":
         skills = loop.skill_registry.list_skills()
-        click.echo(f"  可用 Skill: {', '.join(skills)}")
+        display.print(f"  可用 Skill: {', '.join(skills)}")
     elif command == "/history":
         history = loop.tool_executor.call_history
         if not history:
-            click.echo("  暂无 Tool 调用记录")
+            display.print("  暂无 Tool 调用记录")
         else:
-            click.echo(f"  Tool 调用记录 ({len(history)} 次):")
+            display.print(f"  Tool 调用记录 ({len(history)} 次):")
             for i, call in enumerate(history, 1):
-                click.echo(f"  {i}. {call['tool']} → {call['params']}")
+                display.print(f"  {i}. {call['tool']} -> {call['params']}")
     elif command == "/memory":
         count = loop.memory_store.count
-        click.echo(f"  会话记忆: {count} 条")
+        display.print(f"  会话记忆: {count} 条")
     elif command == "/model":
-        model = getattr(loop, "_model_display", "unknown")
-        click.echo(f"  当前模型: {model}")
+        model_disp = getattr(loop, "_model_display", "unknown")
+        display.print(f"  当前模型: {model_disp}")
     elif command == "/clear":
-        click.clear()
+        display.print("\033[2J\033[H")
     else:
-        click.echo(f"  未知命令: {command}，输入 /help 查看帮助")
+        display.print(f"  未知命令: {command}，输入 /help 查看帮助")
 
 
 # ── One-shot ──
 
 
-async def oneshot(task: str, loop: QueryLoop):
-    """单任务模式：执行 → 输出 → 退出。"""
-    await stream_events(task, loop)
+async def oneshot(task: str, loop: QueryLoop, display: LiveDisplay):
+    """单任务模式：执行 -> 输出 -> 退出。"""
+    await stream_events(task, loop, display)
     await loop.close()
 
 
@@ -325,27 +269,29 @@ def main(
             model=model,
         )
 
-        # 显示 Banner
-        if not quiet:
-            show_loading(duration=1.5)
-            info = get_repo_info()
-            info["model"] = model_display
-            try:
-                click.echo(BANNER.format(**info))
-            except UnicodeEncodeError:
-                click.echo(BANNER.format(**info)
-                           .encode("ascii", errors="replace").decode("ascii"))
-
-        try:
-            if task:
-                await oneshot(task, loop)
-            else:
+        # 创建 LiveDisplay
+        with LiveDisplay(model=model_display, verbose=verbose, quiet=quiet) as display:
+            # 显示 Banner
+            if not quiet:
+                show_loading(duration=1.0)
+                info = get_repo_info()
+                info["model"] = model_display
                 try:
-                    await repl_loop(loop)
-                except KeyboardInterrupt:
-                    click.echo("\n  再见")
-        finally:
-            await loop.close()
+                    display.print(BANNER.format(**info))
+                except UnicodeEncodeError:
+                    display.print(BANNER.format(**info)
+                                  .encode("ascii", errors="replace").decode("ascii"))
+
+            try:
+                if task:
+                    await oneshot(task, loop, display)
+                else:
+                    try:
+                        await repl_loop(loop, display)
+                    except KeyboardInterrupt:
+                        display.print("\n  再见")
+            finally:
+                await loop.close()
 
     try:
         asyncio.run(_run())
