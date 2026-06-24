@@ -460,9 +460,15 @@ class QueryLoop:
             pass
 
     async def close(self):
-        """释放所有资源（LLM client、HTTP 连接等）。"""
+        """释放所有资源（LLM client、MCP client、HTTP 连接等）。"""
         if hasattr(self, "_llm_client") and hasattr(self._llm_client, "close"):
             await self._llm_client.close()
+        # 清理 MCP connections
+        if hasattr(self, "_mcp_dispose") and self._mcp_dispose:
+            try:
+                await self._mcp_dispose()
+            except Exception:
+                pass
 
     async def run_all(self, task: str) -> list[AgentEvent]:
         """收集所有事件到列表（测试用）。"""

@@ -32,6 +32,7 @@ from minicode.tool.patch import PatchFile, ModifyFile
 from minicode.tool.web import WebFetch, WebSearch
 from minicode.tool.ask import AskUser
 from minicode.skill.registry import SkillRegistry
+from minicode.mcp.tools import create_mcp_backed_tools
 from minicode.llm.client import DeepSeekLLMClient, MockLLMClient
 from minicode.memory.store import FileMemoryStore
 from minicode.context.builder import ContextBuilder
@@ -315,42 +316,44 @@ def main(
     if task_file:
         task = Path(task_file).read_text(encoding="utf-8").strip()
 
-    # 构建 QueryLoop（传递 CLI 标志）
-    loop, model_display = _build_loop(
-        auto_approve=auto_approve,
-        dry_run=dry_run,
-        no_memory=no_memory,
-        model=model,
-    )
+    # 单一事件循环执行（MCP 客户端需要共享事件循环）
+    async def _run():
+        loop, model_display = await _build_loop(
+            auto_approve=auto_approve,
+            dry_run=dry_run,
+            no_memory=no_memory,
+            model=model,
+        )
 
-    # 显示 Banner（安静模式跳过）
-    if not quiet:
-        show_loading(duration=1.5)
-        info = get_repo_info()
-        info["model"] = model_display
-        try:
-            click.echo(BANNER.format(**info))
-        except UnicodeEncodeError:
-            click.echo(BANNER.format(**info)
-                       .encode("ascii", errors="replace").decode("ascii"))
-
-    # 单一事件循环执行
-    try:
-        if task:
-            asyncio.run(oneshot(task, loop))
-        else:
+        # 显示 Banner
+        if not quiet:
+            show_loading(duration=1.5)
+            info = get_repo_info()
+            info["model"] = model_display
             try:
-                asyncio.run(repl_loop(loop))
-            except KeyboardInterrupt:
-                click.echo("\n  再见")
-    finally:
+                click.echo(BANNER.format(**info))
+            except UnicodeEncodeError:
+                click.echo(BANNER.format(**info)
+                           .encode("ascii", errors="replace").decode("ascii"))
+
         try:
-            asyncio.run(loop.close())
-        except Exception:
-            pass
+            if task:
+                await oneshot(task, loop)
+            else:
+                try:
+                    await repl_loop(loop)
+                except KeyboardInterrupt:
+                    click.echo("\n  再见")
+        finally:
+            await loop.close()
+
+    try:
+        asyncio.run(_run())
+    except KeyboardInterrupt:
+        click.echo("\n  再见")
 
 
-def _build_loop(
+async def _build_loop(
     auto_approve: bool = False,
     dry_run: bool = False,
     no_memory: bool = False,
@@ -402,6 +405,35 @@ def _build_loop(
     ])
     tool_executor = ToolExecutor(tool_registry)
 
+    # ── MCP 动态能力接入 ──
+    mcp_dispose = None
+    mcp_servers_loaded = 0
+    try:
+        import json as _json
+        mcp_config_path = os.path.join(
+            os.path.expanduser("~"), ".minicode", "mcp.json"
+        )
+        if os.path.exists(mcp_config_path):
+            mcp_config = _json.loads(Path(mcp_config_path).read_text(encoding="utf-8"))
+            mcp_servers_cfg = mcp_config.get("mcpServers", {})
+            if mcp_servers_cfg:
+                mcp_result = await create_mcp_backed_tools(
+                    mcp_servers=mcp_servers_cfg,
+                    cwd=os.getcwd(),
+                )
+                for tool in mcp_result.tools:
+                    tool_registry.register(tool)
+                mcp_servers_loaded = len([s for s in mcp_result.servers if s.status == "connected"])
+                mcp_dispose = mcp_result.dispose
+                if mcp_servers_loaded > 0:
+                    click.echo(
+                        f"  [MCP] 已连接 {mcp_servers_loaded} 个 server, "
+                        f"加载 {len(mcp_result.tools)} 个工具",
+                        err=True,
+                    )
+    except Exception as exc:
+        click.echo(f"  [MCP] 初始化失败: {exc}", err=True)
+
     # ── 构建 Security Classifier（dry_run 时用 mock） ──
     if dry_run:
         security = MockSecurityClassifier()
@@ -420,4 +452,5 @@ def _build_loop(
     )
     loop._llm_client = llm
     loop._model_display = model_display
+    loop._mcp_dispose = mcp_dispose  # MCP 清理回调
     return loop, model_display

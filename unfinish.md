@@ -41,11 +41,11 @@
 
 ---
 
-## ❌ MISSING (1/14)
+## ✅ 现已完成
 
-| # | 模式 | 缺什么 |
-|---|------|--------|
-| 6 | MCP Dynamic Capability | **零 MCP 代码** — 需新建 `mcp/client.py`、`mcp/tools.py`、`~/.minicode/mcp.json` 配置 |
+| # | 模式 | 关键文件 |
+|---|------|---------|
+| 6 | MCP Dynamic Capability | `mcp/client.py` — stdio JSON-RPC；`mcp/tools.py` — 动态工具包装；`~/.minicode/mcp.json` 配置 |
 
 ---
 
@@ -67,9 +67,9 @@
 - [x] 2.5 修复 REASONIX.md 与 spec.md 的矛盾
 
 ### Phase 3 — MCP 动态能力
-- [ ] 3.1 `mcp/client.py` — stdio JSON-RPC 通信
-- [ ] 3.2 `mcp/tools.py` — 动态工具包装
-- [ ] 3.3 `~/.minicode/mcp.json` 配置 + 集成到 _build_loop
+- [x] 3.1 `mcp/client.py` — stdio JSON-RPC 通信
+- [x] 3.2 `mcp/tools.py` — 动态工具包装
+- [x] 3.3 `~/.minicode/mcp.json` 配置 + 集成到 _build_loop
 
 ### Phase 4 — Skills 管理
 - [ ] 4.1 Skill install/remove CLI 命令
