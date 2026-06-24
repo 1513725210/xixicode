@@ -303,14 +303,25 @@ class QueryLoop:
                 ))
                 continue
 
-            # ── Step 5: Observe ──
+            # ── Step 5: Observe（大结果移出 prompt）──
+            try:
+                from minicode.tool.storage import replace_large_result
+                replaced = replace_large_result(
+                    next_action.tool or "unknown",
+                    result.output,
+                )
+                display_output = replaced.preview[:200]
+            except Exception:
+                display_output = result.output[:200]
+
             status_icon = "+" if result.ok else "x"
             yield AgentEvent(
                 type="tool_result",
-                message=f"  {status_icon} {result.output[:100]}",
+                message=f"  {status_icon} {display_output}",
                 detail={
                     "success": result.ok,
-                    "output": result.output,
+                    "output": display_output,
+                    "full_output_path": replaced.full_path if "replaced" in dir() and replaced.full_path else "",
                     "error": result.error,
                     "awaitUser": result.awaitUser,
                 },
