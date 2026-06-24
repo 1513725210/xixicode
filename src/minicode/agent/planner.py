@@ -268,6 +268,62 @@ class LLMPlanner:
         self.accumulated_completion_tokens: int = 0
         self.llm_call_count: int = 0
 
+    @staticmethod
+    def _extract_json(text: str) -> dict | None:
+        """从 LLM 响应中提取 JSON，支持多种常见格式。
+
+        策略（按优先级）：
+        1. ```json ... ``` 代码块
+        2. ``` ... ``` 代码块
+        3. 以 { 开头以 } 结尾的裸 JSON
+        4. 文本中首个 { 到末个 } 之间的内容（处理 LLM 在 JSON 前后加说明文字）
+        """
+        import re
+
+        # 策略 1: ```json ... ``` 代码块
+        m = re.search(r"```json\s*\n(.*?)\n\s*```", text, re.DOTALL)
+        if m:
+            try:
+                return json.loads(m.group(1).strip())
+            except json.JSONDecodeError:
+                pass
+
+        # 策略 2: ``` ... ``` 代码块
+        m = re.search(r"```\s*\n(.*?)\n\s*```", text, re.DOTALL)
+        if m:
+            try:
+                return json.loads(m.group(1).strip())
+            except json.JSONDecodeError:
+                pass
+
+        # 策略 3: 直接尝试解析全文
+        try:
+            return json.loads(text.strip())
+        except json.JSONDecodeError:
+            pass
+
+        # 策略 4: 找到第一个 { 和最后一个 }，提取中间内容
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            candidate = text[start:end + 1]
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                pass
+
+        # 策略 5: 尝试修复常见错误（单引号、尾部逗号等）
+        if start != -1 and end != -1 and end > start:
+            candidate = text[start:end + 1]
+            # 替换单引号为双引号
+            fixed = re.sub(r"(?<!\\)'([^']*?)(?<!\\)'", r'"\1"', candidate)
+            try:
+                return json.loads(fixed)
+            except json.JSONDecodeError:
+                pass
+
+        return None
+
     async def next_step(self, context: LoopContext, system_prompt: str | None = None) -> NextAction:
         """调用 LLM 决定下一步动作。
 
@@ -278,6 +334,10 @@ class LLMPlanner:
         Returns:
             NextAction: 下一步动作或完成信号
         """
+        # 新任务开始 → 重置失败计数器
+        if len(context.history) == 0:
+            self._consecutive_failures = 0
+
         # 强制 max_steps 检查（LLM 可能忽略 prompt 中的限制）
         if len(context.history) >= context.max_steps:
             return NextAction(
@@ -335,8 +395,7 @@ class LLMPlanner:
                 reasoning=f"LLM 调用失败 ({e.message})，fallback #{self._consecutive_failures}",
             )
 
-        # ── LLM 调用成功 → 重置失败计数器 + 累积 token ──
-        self._consecutive_failures = 0
+        # ── LLM 调用成功 → 累积 token ──
         self.accumulated_prompt_tokens += getattr(response, "prompt_tokens", 0)
         self.accumulated_completion_tokens += getattr(response, "completion_tokens", 0)
         self.llm_call_count += 1
@@ -354,25 +413,19 @@ class LLMPlanner:
                 reasoning="LLM 响应缺少 content 字段",
             )
 
-        # ── 去除 markdown 代码块（健壮版本） ──
+        # ── JSON 提取（多策略，处理各种 LLM 响应格式）──
         import re
-        # 1) 尝试提取 ``` ... ``` 之间的内容
-        m = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", content, re.DOTALL)
-        if m:
-            content = m.group(1).strip()
-        # 2) 如果内容以 ``` 开头但没有闭合，去掉第一行
-        elif content.startswith("```"):
-            lines = content.split("\n")
-            content = "\n".join(lines[1:]).strip()
-
-        try:
-            data = json.loads(content)
-        except (json.JSONDecodeError, KeyError, TypeError, AttributeError) as e:
+        data = self._extract_json(content)
+        if data is None:
             self._consecutive_failures += 1
             if self._consecutive_failures >= 3:
                 return NextAction(
                     done=True,
-                    reasoning=f"LLM 连续 {self._consecutive_failures} 次返回无效 JSON。请检查模型是否兼容。",
+                    reasoning=(
+                        f"LLM 连续 {self._consecutive_failures} 次返回无法解析的响应。"
+                        "已自动降级到本地 KeywordPlanner 模式。"
+                        "请检查: 1) API Key 是否有效 2) 模型是否兼容。"
+                    ),
                 )
             idx = (self._consecutive_failures - 1) % len(self._FALLBACK_TOOLS)
             tool_name, params, desc = self._FALLBACK_TOOLS[idx]
@@ -381,7 +434,7 @@ class LLMPlanner:
                 tool=tool_name,
                 params=params,
                 description=f"{desc}（LLM JSON 解析失败）",
-                reasoning=f"JSON 解析失败: {e}",
+                reasoning=f"JSON 解析失败 (尝试 #{self._consecutive_failures})",
             )
 
         if data.get("done", False):
@@ -436,10 +489,9 @@ class LLMPlanner:
 
         try:
             content = response.content.strip()
-            if content.startswith("```"):
-                lines = content.split("\n")
-                content = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
-            data = json.loads(content)
+            data = self._extract_json(content)
+            if data is None:
+                raise json.JSONDecodeError("No JSON found", content, 0)
             steps = [PlanStep(s["description"], s["tool"], s.get("params", {})) for s in data.get("steps", [])]
             return Plan(reasoning=data.get("reasoning", ""), steps=steps)
         except (json.JSONDecodeError, KeyError, TypeError, AttributeError):
