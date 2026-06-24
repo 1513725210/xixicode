@@ -67,6 +67,24 @@ class QueryLoop:
         self.step_count = 0
         self.tool_count = 0
 
+        # ── 注入检测（Security Layer 2）──
+        try:
+            from minicode.security.injection import detect_injection
+            injection_verdict = detect_injection(task, tool_name="", params={})
+            if injection_verdict.detected:
+                yield AgentEvent(
+                    type="need_approval",
+                    message=f"检测到可能的注入攻击 [{injection_verdict.risk_level.upper()}]: {', '.join(injection_verdict.patterns_matched[:3])}",
+                    detail={
+                        "injection_detected": True,
+                        "risk_level": injection_verdict.risk_level,
+                        "patterns": injection_verdict.patterns_matched,
+                    },
+                )
+        except Exception:
+            # 注入检测失败不影响主流程
+            pass
+
         # ── 初始分析 ──
         yield AgentEvent(type="thinking", message="分析中...", detail={"phase": "planning"})
         memories = await self.memory_store.search(task, top_k=3) if not self._no_memory else []
@@ -120,7 +138,13 @@ class QueryLoop:
             self.step_count += 1
 
             # ── Step 2: Think (LLM 决策) ──
-            yield AgentEvent(type="thinking", message="决策中...", detail={"phase": "deciding"})
+            # 附加 token 使用信息（如可用）
+            thinking_detail: dict = {"phase": "deciding"}
+            if hasattr(self.planner, "accumulated_prompt_tokens"):
+                thinking_detail["tokens_prompt"] = self.planner.accumulated_prompt_tokens
+                thinking_detail["tokens_completion"] = self.planner.accumulated_completion_tokens
+                thinking_detail["llm_calls"] = self.planner.llm_call_count
+            yield AgentEvent(type="thinking", message="决策中...", detail=thinking_detail)
 
             next_action = await self.planner.next_step(context, system_prompt=system_prompt)
 
@@ -311,6 +335,48 @@ class QueryLoop:
                 # 暂停当前回合 — 等待用户回复后继续
                 # （REPL 模式下，用户的下一条消息会作为新任务继续）
                 break
+
+            # ── Step 7: Session 持久化 ──
+            try:
+                from minicode.session import save_event as save_session_event  # noqa: F811
+                save_session_event(
+                    session_id=getattr(self, "_session_id", "default"),
+                    event_type="tool_call",
+                    content=f"{next_action.tool}: {next_action.description}",
+                    metadata={
+                        "tool": next_action.tool,
+                        "params": next_action.params,
+                        "ok": result.ok,
+                        "output_snippet": result.output[:100],
+                    },
+                )
+            except Exception:
+                pass  # session 保存失败不影响主流程
+
+            # ── Step 8: 自动上下文压缩检查 ──
+            if self.step_count % 3 == 0 and len(context.history) > 5:
+                try:
+                    from minicode.context.compressor import estimate_tokens, compress_to_L2
+                    history_text = "\n".join(
+                        f"[{h.tool}] {h.description} → {h.output}"
+                        for h in context.history
+                    )
+                    est_tokens = estimate_tokens(history_text)
+                    # 超过 2000 token 时触发压缩
+                    if est_tokens > 2000:
+                        compressed = compress_to_L2(history_text, task)
+                        yield AgentEvent(
+                            type="progress",
+                            message=f"上下文压缩: {est_tokens} → ~{compressed.compressed_tokens} tokens",
+                            detail={
+                                "phase": "compaction",
+                                "pre_tokens": est_tokens,
+                                "post_tokens": compressed.compressed_tokens,
+                                "level": compressed.level,
+                            },
+                        )
+                except Exception:
+                    pass  # 压缩失败不影响主流程
 
             if result.ok and not self._no_memory:
                 await self.memory_store.add_episodic(

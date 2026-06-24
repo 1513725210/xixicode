@@ -263,6 +263,10 @@ class LLMPlanner:
         self.llm = llm_client
         # 连续失败计数器（LLM 错误 和 JSON 解析错误 共用）
         self._consecutive_failures: int = 0
+        # Provider usage 累积
+        self.accumulated_prompt_tokens: int = 0
+        self.accumulated_completion_tokens: int = 0
+        self.llm_call_count: int = 0
 
     async def next_step(self, context: LoopContext, system_prompt: str | None = None) -> NextAction:
         """调用 LLM 决定下一步动作。
@@ -331,8 +335,11 @@ class LLMPlanner:
                 reasoning=f"LLM 调用失败 ({e.message})，fallback #{self._consecutive_failures}",
             )
 
-        # ── LLM 调用成功 → 重置失败计数器 ──
+        # ── LLM 调用成功 → 重置失败计数器 + 累积 token ──
         self._consecutive_failures = 0
+        self.accumulated_prompt_tokens += getattr(response, "prompt_tokens", 0)
+        self.accumulated_completion_tokens += getattr(response, "completion_tokens", 0)
+        self.llm_call_count += 1
 
         # ── 安全的 content 提取 ──
         try:

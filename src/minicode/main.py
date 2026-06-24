@@ -370,10 +370,14 @@ def _build_loop(
         llm = DeepSeekLLMClient(api_key=api_key)
         planner = LLMPlanner(llm)
         model_display = model or "deepseek-chat"
+        # LLM 可用 → 使用 LLM SkillRouter 替代关键词匹配
+        from minicode.skill.router import SkillRouter as LLMSkillRouter
+        skill_registry = SkillRegistry(skill_router=LLMSkillRouter(llm))
     else:
         llm = MockLLMClient()
         planner = KeywordPlanner()
         model_display = "mock (V1 skeleton)"
+        skill_registry = SkillRegistry()
 
     # ── 构建真实 Tool 执行器 ──
     tool_registry = ToolRegistry()
