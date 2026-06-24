@@ -15,6 +15,7 @@
 """
 
 import asyncio
+import inspect
 from typing import AsyncIterator
 
 from minicode.events import AgentEvent
@@ -28,6 +29,9 @@ class QueryLoop:
     整个过程持续 yield AgentEvent 供 CLI 层渲染。
     """
 
+    # 审批等待超时（秒）
+    _APPROVAL_TIMEOUT = 300
+
     def __init__(
         self,
         planner,
@@ -36,6 +40,8 @@ class QueryLoop:
         memory_store,
         context_builder,
         security_classifier,
+        auto_approve: bool = False,
+        no_memory: bool = False,
     ):
         self.planner = planner
         self.skill_registry = skill_registry
@@ -43,6 +49,8 @@ class QueryLoop:
         self.memory_store = memory_store
         self.context_builder = context_builder
         self.security_classifier = security_classifier
+        self._auto_approve = auto_approve
+        self._no_memory = no_memory
 
         self.step_count = 0
         self.tool_count = 0
@@ -61,10 +69,46 @@ class QueryLoop:
 
         # ── 初始分析 ──
         yield AgentEvent(type="thinking", message="分析中...", detail={"phase": "planning"})
-        memories = await self.memory_store.search(task, top_k=3)
+        memories = await self.memory_store.search(task, top_k=3) if not self._no_memory else []
         skill = await self.skill_registry.select(task)
 
         context = LoopContext(task=task, memories=memories)
+
+        # ── Skill 注入：获取完整 Skill 定义 ──
+        skill_def = None
+        skill_prompt = ""
+        if hasattr(self.skill_registry, "get_skill"):
+            skill_def = self.skill_registry.get_skill(skill)
+
+        # ── 构建 system prompt ──
+        tools = getattr(
+            getattr(self.tool_executor, "registry", None), "list_tools", lambda: []
+        )()
+        # Skill 的 tool_allowlist 约束可用工具
+        if skill_def and skill_def.get("tool_allowlist"):
+            allowed = set(skill_def["tool_allowlist"])
+            tools = [t for t in tools if t["name"] in allowed]
+        if skill_def and skill_def.get("system_prompt"):
+            skill_prompt = skill_def["system_prompt"]
+
+        # 兼容 sync/async ContextBuilder
+        build_fn = self.context_builder.build
+        if inspect.iscoroutinefunction(build_fn):
+            system_prompt = await build_fn(
+                task=task,
+                workspace="",
+                tools=tools,
+                memories=memories,
+                skill_prompt=skill_prompt,
+            )
+        else:
+            system_prompt = build_fn(
+                task=task,
+                workspace="",
+                tools=tools,
+                memories=memories,
+                skill_prompt=skill_prompt,
+            )
 
         yield AgentEvent(type="progress", message=f"Skill: {skill}")
         yield AgentEvent(type="thinking", message="分析完毕", detail={"phase": "ready"})
@@ -78,7 +122,7 @@ class QueryLoop:
             # ── Step 2: Think (LLM 决策) ──
             yield AgentEvent(type="thinking", message="决策中...", detail={"phase": "deciding"})
 
-            next_action = await self.planner.next_step(context)
+            next_action = await self.planner.next_step(context, system_prompt=system_prompt)
 
             # ── 检查完成 ──
             if next_action.done:
@@ -115,40 +159,89 @@ class QueryLoop:
                 )
 
             # ── Step 3: Security Check + 审批 ──
-            risk = self.security_classifier.classify(
+            verdict = self.security_classifier.check(
                 next_action.tool or "", next_action.params or {}
             )
 
-            if risk in ("medium", "high"):
-                approval_event = asyncio.Event()
-                approval_result = {"approved": False}
-
+            if verdict.blocked:
+                # 被安全规则阻断 → 不可恢复，记录并跳过
                 yield AgentEvent(
                     type="need_approval",
-                    message=f"需要审批: {next_action.tool} [{risk.upper()}]",
+                    message=f"操作被阻断: {verdict.reason}",
                     detail={
                         "tool": next_action.tool,
-                        "risk": risk,
+                        "risk": "high",
+                        "blocked": True,
+                        "reason": verdict.reason,
                         "description": next_action.description,
                         "params": next_action.params,
-                        "_approval_event": approval_event,
-                        "_approval_result": approval_result,
                     },
                 )
+                context.history.append(StepResult(
+                    step=self.step_count,
+                    tool=next_action.tool or "unknown",
+                    description=next_action.description,
+                    success=False,
+                    output=f"安全阻断: {verdict.reason}",
+                ))
+                continue
 
-                # 🔒 阻塞等待 CLI 层设置 approval_event
-                await approval_event.wait()
+            if verdict.risk_level in ("medium", "high"):
+                # 自动批准模式 → 跳过审批
+                if self._auto_approve:
+                    yield AgentEvent(
+                        type="need_approval",
+                        message=f"自动批准: {next_action.tool} [{verdict.risk_level.upper()}]",
+                        detail={
+                            "tool": next_action.tool,
+                            "risk": verdict.risk_level,
+                            "description": next_action.description,
+                            "auto_approved": True,
+                        },
+                    )
+                else:
+                    approval_event = asyncio.Event()
+                    approval_result = {"approved": False}
 
-                if not approval_result["approved"]:
-                    # 用户拒绝 → 记录失败历史，让下一轮 LLM 重规划
-                    context.history.append(StepResult(
-                        step=self.step_count,
-                        tool=next_action.tool or "unknown",
-                        description=next_action.description,
-                        success=False,
-                        output="用户拒绝了此操作",
-                    ))
-                    continue
+                    yield AgentEvent(
+                        type="need_approval",
+                        message=f"需要审批: {next_action.tool} [{verdict.risk_level.upper()}]",
+                        detail={
+                            "tool": next_action.tool,
+                            "risk": verdict.risk_level,
+                            "description": next_action.description,
+                            "params": next_action.params,
+                            "_approval_event": approval_event,
+                            "_approval_result": approval_result,
+                        },
+                    )
+
+                    # 等待 CLI 层审批（带超时保护）
+                    try:
+                        await asyncio.wait_for(
+                            approval_event.wait(),
+                            timeout=self._APPROVAL_TIMEOUT,
+                        )
+                    except asyncio.TimeoutError:
+                        # 超时 → 自动拒绝
+                        context.history.append(StepResult(
+                            step=self.step_count,
+                            tool=next_action.tool or "unknown",
+                            description=next_action.description,
+                            success=False,
+                            output="审批超时，已自动拒绝",
+                        ))
+                        continue
+
+                    if not approval_result["approved"]:
+                        context.history.append(StepResult(
+                            step=self.step_count,
+                            tool=next_action.tool or "unknown",
+                            description=next_action.description,
+                            success=False,
+                            output="用户拒绝了此操作",
+                        ))
+                        continue
 
             # ── Step 4: Execute Tool（容错） ──
             self.tool_count += 1
@@ -163,8 +256,7 @@ class QueryLoop:
                     next_action.tool or "unknown", next_action.params or {}
                 )
             except Exception as exc:
-                # 🔧 执行异常 → 记录失败，让 LLM 决策下一步
-                status_icon = "✗"
+                status_icon = "x"
                 output = f"执行异常: {type(exc).__name__}: {exc}"
                 yield AgentEvent(
                     type="tool_result",
@@ -181,14 +273,15 @@ class QueryLoop:
                 continue
 
             # ── Step 5: Observe ──
-            status_icon = "✓" if result.success else "✗"
+            status_icon = "+" if result.ok else "x"
             yield AgentEvent(
                 type="tool_result",
                 message=f"  {status_icon} {result.output[:100]}",
                 detail={
-                    "success": result.success,
+                    "success": result.ok,
                     "output": result.output,
                     "error": result.error,
+                    "awaitUser": result.awaitUser,
                 },
             )
 
@@ -197,11 +290,29 @@ class QueryLoop:
                 step=self.step_count,
                 tool=next_action.tool or "unknown",
                 description=next_action.description,
-                success=result.success,
+                success=result.ok,
                 output=result.output[:200],
             ))
 
-            if result.success:
+            # ── 处理 awaitUser（参考 MiniCode agent-loop.ts:439-453）──
+            if result.awaitUser:
+                question = result.output.strip()
+                if question:
+                    # 通知外部：Agent 需要用户输入
+                    yield AgentEvent(
+                        type="need_approval",
+                        message=f"Agent 提问: {question[:100]}",
+                        detail={
+                            "tool": next_action.tool,
+                            "question": question,
+                            "_await_user": True,
+                        },
+                    )
+                # 暂停当前回合 — 等待用户回复后继续
+                # （REPL 模式下，用户的下一条消息会作为新任务继续）
+                break
+
+            if result.ok and not self._no_memory:
                 await self.memory_store.add_episodic(
                     task=task,
                     step=next_action.description,
@@ -209,7 +320,18 @@ class QueryLoop:
                     result=result.output[:200],
                 )
 
-        # ── Done ──
+        # ── Synthesize: 合成最终回答 ──
+        yield AgentEvent(
+            type="reflection",
+            message="合成总结中...",
+            detail={"phase": "synthesizing"},
+        )
+
+        try:
+            summary = await self.planner.synthesize(context)
+        except Exception:
+            summary = f"任务完成 · {self.step_count} 步 · {self.tool_count} Tool"
+
         yield AgentEvent(
             type="done",
             message=f"任务完成 · {self.step_count} 步 · {self.tool_count} Tool",
@@ -217,8 +339,46 @@ class QueryLoop:
                 "steps": self.step_count,
                 "tools": self.tool_count,
                 "skill": skill,
+                "summary": summary,
             },
         )
+
+        # ── Reflection: 任务结束后反思 ──
+        try:
+            from minicode.agent.reflection import ReflectionAgent
+            llm = getattr(self, "_llm_client", None)
+            if llm:
+                yield AgentEvent(
+                    type="reflection",
+                    message="反思中...",
+                    detail={"phase": "reflecting"},
+                )
+
+                task_success = all(h.success for h in context.history) if context.history else True
+                reflection = ReflectionAgent(llm, self.memory_store)
+                result = await reflection.reflect(
+                    task=task,
+                    history=context.history,
+                    success=task_success,
+                )
+                if result.summary:
+                    yield AgentEvent(
+                        type="reflection",
+                        message=f"经验: {result.summary[:200]}",
+                        detail={
+                            "phase": "reflection_done",
+                            "lessons": result.lessons,
+                            "root_cause": result.root_cause,
+                        },
+                    )
+        except Exception:
+            # 反思失败不影响任务结果
+            pass
+
+    async def close(self):
+        """释放所有资源（LLM client、HTTP 连接等）。"""
+        if hasattr(self, "_llm_client") and hasattr(self._llm_client, "close"):
+            await self._llm_client.close()
 
     async def run_all(self, task: str) -> list[AgentEvent]:
         """收集所有事件到列表（测试用）。"""

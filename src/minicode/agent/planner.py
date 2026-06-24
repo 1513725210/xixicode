@@ -11,6 +11,8 @@ LLMPlanner: LLM 驱动的推理规划（生产用）
 import json
 from dataclasses import dataclass, field
 
+from minicode.llm.client import LLMError
+
 
 @dataclass
 class PlanStep:
@@ -98,6 +100,10 @@ class KeywordPlanner:
             ("编写测试用例", "write_file", {"path": "tests/"}),
             ("运行测试", "run_test", {"target": "all"}),
         ],
+        "create": [
+            ("确认目标目录", "list_directory", {"path": "."}),
+            ("创建文件", "write_file", {"path": "output.txt", "content": ""}),
+        ],
         "explore": [
             ("获取项目顶层目录结构", "list_directory", {"path": "."}),
             ("识别关键模块和入口文件", "read_file", {"path": "src/"}),
@@ -114,13 +120,16 @@ class KeywordPlanner:
             return "refactor"
         if any(kw in tl for kw in ["test", "测试"]):
             return "test"
+        if any(kw in tl for kw in ["create", "创建", "写", "生成", "新建", "添加文件", "写入", "touch"]):
+            return "create"
         return "explore"
 
-    async def next_step(self, context: LoopContext) -> NextAction:
+    async def next_step(self, context: LoopContext, system_prompt: str | None = None) -> NextAction:
         """基于关键词和已执行历史返回下一步动作。
 
         Args:
             context: 当前循环上下文
+            system_prompt: 可选（KeywordPlanner 不使用，保持接口兼容）
 
         Returns:
             NextAction: 下一步（或 done=True）
@@ -148,6 +157,37 @@ class KeywordPlanner:
         steps = [PlanStep(d, t, p) for d, t, p in steps_data]
         return Plan(reasoning=f"KeywordPlanner: {category} flow", steps=steps)
 
+    async def synthesize(self, context: LoopContext) -> str:
+        """基于执行历史合成最终回答（离线模式）。
+
+        Args:
+            context: 循环上下文（含完整执行历史）
+
+        Returns:
+            str: 人类可读的总结
+        """
+        if not context.history:
+            return "未执行任何步骤。"
+
+        lines = [f"## 任务执行总结\n"]
+        lines.append(f"**任务:** {context.task}\n")
+        lines.append(f"**执行步数:** {len(context.history)}\n")
+
+        successes = [h for h in context.history if h.success]
+        failures = [h for h in context.history if not h.success]
+        lines.append(f"**成功:** {len(successes)} 步，**失败:** {len(failures)} 步\n")
+
+        lines.append("### 执行过程\n")
+        for h in context.history:
+            icon = "+" if h.success else "x"
+            lines.append(f"- {icon} [{h.tool}] {h.description}")
+            if h.output:
+                # 摘要: 取输出的第一行或前 80 字符
+                first_line = h.output.split("\n")[0][:120]
+                lines.append(f"  → {first_line}")
+
+        return "\n".join(lines)
+
 
 # ═══════════════════════════════════════════════════════════
 # LLMPlanner — 生产用（DeepSeek API 驱动）
@@ -159,7 +199,18 @@ class LLMPlanner:
 
     每次 next_step() 调用 LLM 评估：
     "基于当前任务和执行历史，下一步该做什么？"
+
+    LLM 不可用时的 fallback 策略：
+    - 第 1-2 次失败: 尝试不同的探索工具
+    - 第 3 次失败: 返回 done=true，清晰报错
     """
+
+    # ── LLM 不可用时的智能 fallback 工具序列 ──
+    _FALLBACK_TOOLS = [
+        ("list_directory", {"path": "."}, "浏览项目结构"),
+        ("search_file", {"pattern": "*.py", "path": "."}, "查找 Python 源文件"),
+        ("git_status", {}, "检查 Git 变更"),
+    ]
 
     AVAILABLE_TOOLS = [
         {"name": "list_directory", "description": "列出目录内容", "params": {"path": "目录路径"}},
@@ -167,12 +218,17 @@ class LLMPlanner:
         {"name": "grep", "description": "搜索文件内容 (正则)", "params": {"pattern": "搜索模式", "path": "搜索目录"}},
         {"name": "search_file", "description": "按文件名搜索", "params": {"pattern": "文件名模式", "path": "搜索目录"}},
         {"name": "edit_file", "description": "SEARCH/REPLACE 精确编辑", "params": {"path": "文件路径", "search": "原文本", "replace": "新文本"}},
+        {"name": "patch_file", "description": "批量 SEARCH/REPLACE 替换", "params": {"path": "文件路径", "replacements": [{"search": "原文本", "replace": "新文本"}]}},
+        {"name": "modify_file", "description": "用新内容完整替换文件", "params": {"path": "文件路径", "content": "新内容"}},
         {"name": "write_file", "description": "写入/创建文件", "params": {"path": "文件路径", "content": "内容"}},
         {"name": "run_command", "description": "执行 shell 命令", "params": {"command": "命令字符串"}},
         {"name": "run_test", "description": "运行测试", "params": {"target": "测试目标"}},
         {"name": "git_status", "description": "Git 工作区状态", "params": {}},
         {"name": "git_diff", "description": "Git 差异", "params": {}},
         {"name": "git_log", "description": "Git 提交历史", "params": {"count": "条数"}},
+        {"name": "web_fetch", "description": "获取网页内容", "params": {"url": "URL地址"}},
+        {"name": "web_search", "description": "搜索网页", "params": {"query": "搜索关键词"}},
+        {"name": "ask_user", "description": "向用户提问并等待回复", "params": {"question": "问题文本"}},
     ]
 
     SYSTEM_PROMPT = """你是一个 Coding Agent 的执行规划器。你的任务是根据执行历史，决定下一步应该做什么。
@@ -205,23 +261,36 @@ class LLMPlanner:
 
     def __init__(self, llm_client):
         self.llm = llm_client
+        # 连续失败计数器（LLM 错误 和 JSON 解析错误 共用）
+        self._consecutive_failures: int = 0
 
-    async def next_step(self, context: LoopContext) -> NextAction:
+    async def next_step(self, context: LoopContext, system_prompt: str | None = None) -> NextAction:
         """调用 LLM 决定下一步动作。
 
         Args:
             context: 当前循环上下文（含历史）
+            system_prompt: 可选的自定义 system prompt（由 ContextBuilder 提供）
 
         Returns:
             NextAction: 下一步动作或完成信号
         """
+        # 强制 max_steps 检查（LLM 可能忽略 prompt 中的限制）
+        if len(context.history) >= context.max_steps:
+            return NextAction(
+                done=True,
+                reasoning=f"已达最大步数上限 ({context.max_steps})",
+            )
+
         tools_json = json.dumps(self.AVAILABLE_TOOLS, ensure_ascii=False, indent=2)
-        system_prompt = self.SYSTEM_PROMPT.format(tools_json=tools_json)
+        if system_prompt:
+            system_prompt = system_prompt + f"\n\n可用 Tool：\n{tools_json}"
+        else:
+            system_prompt = self.SYSTEM_PROMPT.format(tools_json=tools_json)
 
         # 构建执行历史
         history_lines = []
         for h in context.history:
-            status = "✓" if h.success else "✗"
+            status = "+" if h.success else "x"
             history_lines.append(
                 f"  {h.step}. [{status}] {h.tool}: {h.description} → {h.output[:150]}"
             )
@@ -235,44 +304,98 @@ class LLMPlanner:
             )},
         ]
 
-        response = await self.llm.chat(
-            messages=messages,
-            model="deepseek-chat",
-            temperature=0.1,
-            max_tokens=512,
-        )
-
         try:
-            content = response.content.strip()
-            if content.startswith("```"):
-                lines = content.split("\n")
-                content = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
-
-            data = json.loads(content)
-
-            if data.get("done", False):
+            response = await self.llm.chat(
+                messages=messages,
+                model="deepseek-chat",
+                temperature=0.1,
+                max_tokens=512,
+            )
+        except LLMError as e:
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= 3:
                 return NextAction(
                     done=True,
-                    reasoning=data.get("reasoning", "任务完成"),
+                    reasoning=(
+                        f"LLM API 连续 {self._consecutive_failures} 次调用失败 ({e.message})。"
+                        "请检查 API Key 是否有效、网络是否正常。"
+                    ),
                 )
-
+            idx = (self._consecutive_failures - 1) % len(self._FALLBACK_TOOLS)
+            tool_name, params, desc = self._FALLBACK_TOOLS[idx]
             return NextAction(
                 done=False,
-                tool=data.get("tool", "list_directory"),
-                params=data.get("params", {"path": "."}),
-                description=data.get("description", "探索"),
-                reasoning=data.get("reasoning", ""),
+                tool=tool_name,
+                params=params,
+                description=f"{desc}（LLM 不可用，使用本地策略）",
+                reasoning=f"LLM 调用失败 ({e.message})，fallback #{self._consecutive_failures}",
             )
 
-        except (json.JSONDecodeError, KeyError, TypeError) as e:
-            # 解析失败时返回一个安全的探索动作
+        # ── LLM 调用成功 → 重置失败计数器 ──
+        self._consecutive_failures = 0
+
+        # ── 安全的 content 提取 ──
+        try:
+            content = response.content.strip()
+        except AttributeError:
+            self._consecutive_failures += 1
             return NextAction(
                 done=False,
                 tool="list_directory",
                 params={"path": "."},
-                description="探索项目结构（fallback）",
-                reasoning=f"LLM 响应解析失败: {e}",
+                description="探索项目结构（LLM 响应格式异常）",
+                reasoning="LLM 响应缺少 content 字段",
             )
+
+        # ── 去除 markdown 代码块（健壮版本） ──
+        import re
+        # 1) 尝试提取 ``` ... ``` 之间的内容
+        m = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", content, re.DOTALL)
+        if m:
+            content = m.group(1).strip()
+        # 2) 如果内容以 ``` 开头但没有闭合，去掉第一行
+        elif content.startswith("```"):
+            lines = content.split("\n")
+            content = "\n".join(lines[1:]).strip()
+
+        try:
+            data = json.loads(content)
+        except (json.JSONDecodeError, KeyError, TypeError, AttributeError) as e:
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= 3:
+                return NextAction(
+                    done=True,
+                    reasoning=f"LLM 连续 {self._consecutive_failures} 次返回无效 JSON。请检查模型是否兼容。",
+                )
+            idx = (self._consecutive_failures - 1) % len(self._FALLBACK_TOOLS)
+            tool_name, params, desc = self._FALLBACK_TOOLS[idx]
+            return NextAction(
+                done=False,
+                tool=tool_name,
+                params=params,
+                description=f"{desc}（LLM JSON 解析失败）",
+                reasoning=f"JSON 解析失败: {e}",
+            )
+
+        if data.get("done", False):
+            return NextAction(
+                done=True,
+                reasoning=data.get("reasoning", "任务完成"),
+            )
+
+        # 验证 tool 名称
+        tool = data.get("tool", "")
+        valid_tools = {t["name"] for t in self.AVAILABLE_TOOLS}
+        if tool not in valid_tools:
+            tool = "list_directory"
+
+        return NextAction(
+            done=False,
+            tool=tool,
+            params=data.get("params") or {},
+            description=data.get("description", "探索"),
+            reasoning=data.get("reasoning", ""),
+        )
 
     async def plan(self, task: str) -> Plan:
         """一次性规划（保留兼容旧接口）。"""
@@ -293,7 +416,16 @@ class LLMPlanner:
             {"role": "user", "content": f"任务：{task}"},
         ]
 
-        response = await self.llm.chat(messages=messages, temperature=0.1, max_tokens=1024)
+        try:
+            response = await self.llm.chat(messages=messages, temperature=0.1, max_tokens=1024)
+        except LLMError as e:
+            return Plan(
+                reasoning=f"LLM 不可用: {e.message}",
+                steps=[
+                    PlanStep("探索项目结构", "list_directory", {"path": "."}),
+                    PlanStep("阅读关键文件", "read_file", {"path": "src/"}),
+                ],
+            )
 
         try:
             content = response.content.strip()
@@ -303,7 +435,7 @@ class LLMPlanner:
             data = json.loads(content)
             steps = [PlanStep(s["description"], s["tool"], s.get("params", {})) for s in data.get("steps", [])]
             return Plan(reasoning=data.get("reasoning", ""), steps=steps)
-        except (json.JSONDecodeError, KeyError, TypeError):
+        except (json.JSONDecodeError, KeyError, TypeError, AttributeError):
             return Plan(
                 reasoning="Fallback plan",
                 steps=[
@@ -311,3 +443,63 @@ class LLMPlanner:
                     PlanStep("阅读关键文件", "read_file", {"path": "src/"}),
                 ],
             )
+
+    # ── Synthesize: 合成最终回答 ──
+
+    SYNTHESIZE_PROMPT = """你是一个 Coding Agent。用户给了你一个任务，你已经执行了一系列步骤来探索/分析/修改代码。
+
+现在，请基于执行历史，**用中文写一段简洁的总结回答**。要求：
+
+1. 直接回应用户最可能的意图（理解项目、定位问题、分析代码等）
+2. 点出关键发现、重要文件、值得注意的地方
+3. 结构化：用小标题分段，用列表而非大段文字
+4. 控制在 500 字以内
+5. 如果执行中有失败步骤，诚实说明
+
+不用复述每个步骤的细节——给用户一个"结论"而非"流水账"。
+"""
+
+    async def synthesize(self, context: LoopContext) -> str:
+        """基于执行历史合成最终回答（LLM 模式）。
+
+        Args:
+            context: 循环上下文（含完整执行历史）
+
+        Returns:
+            str: LLM 合成的总结
+        """
+        if not context.history:
+            return "未执行任何步骤。"
+
+        # 构建历史摘要
+        history_lines = []
+        for h in context.history:
+            status = "+" if h.success else "x"
+            history_lines.append(
+                f"  {h.step}. [{status}] {h.tool}: {h.description}\n"
+                f"     输出: {h.output[:200]}"
+            )
+        history_text = "\n".join(history_lines)
+
+        messages = [
+            {"role": "system", "content": self.SYNTHESIZE_PROMPT},
+            {"role": "user", "content": f"任务: {context.task}\n\n执行历史:\n{history_text}"},
+        ]
+
+        try:
+            response = await self.llm.chat(
+                messages=messages,
+                temperature=0.3,
+                max_tokens=800,
+            )
+            return response.content.strip()
+        except Exception:
+            # LLM 不可用时 fallback 到简单摘要
+            lines = [f"## {context.task}\n"]
+            successes = [h for h in context.history if h.success]
+            for h in context.history:
+                icon = "+" if h.success else "x"
+                lines.append(f"- {icon} [{h.tool}] {h.description}")
+                if h.output:
+                    lines.append(f"  → {h.output.split(chr(10))[0][:120]}")
+            return "\n".join(lines)

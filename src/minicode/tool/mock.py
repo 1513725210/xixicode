@@ -2,6 +2,10 @@
 
 V1 第一阶段：所有 Tool 用 Mock，先让 Agent Loop 跑通。
 后续逐步替换为真实实现（ReadFile, WriteFile, EditFile...）。
+
+参考 MiniCode 的 mock-model.ts 分层设计：
+- content-aware: 根据 params 返回不同的 Mock 输出
+- 覆盖所有已注册工具名称
 """
 
 from minicode.tool.base import ToolResult
@@ -21,30 +25,29 @@ class MockToolExecutor:
         """模拟执行一个 Tool。
 
         Args:
-            tool_name: 工具名称 (如 "grep", "read_file")
+            tool_name: 工具名称
             params: 工具参数
 
         Returns:
-            ToolResult: 总是 success=True 的模拟结果
+            ToolResult: 总是 ok=True 的模拟结果
         """
         self.call_history.append({"tool": tool_name, "params": params})
 
-        # 根据 params 返回更合理的 Mock 输出（不再固定返回 OrderService）
         pattern = params.get("pattern", "")
         path = params.get("path", "")
         glob = params.get("glob", "")
+        query = params.get("query", "")
 
-        # params-aware outputs — 内容随输入变化
         if tool_name == "grep":
             if "import" in pattern or "from " in pattern:
                 output = (
-                    f"80+ 处 import 语句分布于:\n"
-                    f"  main.py → events.py, agent/ (loop.py, planner.py)\n"
-                    f"  tool/ → base.py, mock.py\n"
-                    f"  llm/ → client.py\n"
-                    f"  memory/ → store.py\n"
-                    f"  context/ → builder.py\n"
-                    f"  security/ → classifier.py"
+                    "80+ 处 import 语句分布于:\n"
+                    "  main.py → events.py, agent/ (loop.py, planner.py)\n"
+                    "  tool/ → base.py, mock.py\n"
+                    "  llm/ → client.py\n"
+                    "  memory/ → store.py\n"
+                    "  context/ → builder.py\n"
+                    "  security/ → classifier.py"
                 )
             elif pattern:
                 output = f"在 {path or '.'} 中搜索 '{pattern[:40]}' → 找到 2 处匹配"
@@ -83,19 +86,47 @@ class MockToolExecutor:
                 "  .gitignore"
             )
 
+        elif tool_name == "web_search":
+            output = (
+                f"QUERY: {query}\n\n"
+                "[1] Mock Result 1\n"
+                "    URL: https://example.com/1\n"
+                "    Mock search result snippet for demonstration.\n\n"
+                "[2] Mock Result 2\n"
+                "    URL: https://example.com/2\n"
+                "    Another mock search result.\n"
+            )
+
+        elif tool_name == "web_fetch":
+            url = params.get("url", "")
+            output = (
+                f"URL: {url}\n"
+                f"STATUS: 200\n"
+                f"CONTENT_TYPE: text/html\n"
+                f"TITLE: Mock Page Title\n\n"
+                f"Mock page content for {url}. This is simulated content."
+            )
+
+        elif tool_name == "ask_user":
+            question = params.get("question", "")
+            return ToolResult(ok=True, output=question, awaitUser=True)
+
         else:
             fallback = {
                 "edit_file": "已修改文件 (3 行替换)",
+                "patch_file": "已修补文件 (2 处替换)",
+                "modify_file": "已修改文件 (45 行 → 52 行)",
                 "write_file": "已写入文件 (45 行)",
                 "run_test": "12/12 测试通过",
-                "git_diff": "1 个文件变更, +4 -3",
                 "git_status": "modified: src/order_service.py",
+                "git_diff": "1 个文件变更, +4 -3",
                 "git_log": "最近 5 条提交",
+                "git_show": "commit abc123: Fix NPE in OrderService",
                 "search_file": "找到 8 个匹配文件",
             }
             output = fallback.get(tool_name, f"[Mock] {tool_name} 执行完成")
 
-        return ToolResult(success=True, output=output)
+        return ToolResult(ok=True, output=output)
 
     @property
     def call_count(self) -> int:

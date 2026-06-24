@@ -20,13 +20,13 @@ EventType = Literal[
 ]
 
 EVENT_ICONS: dict[EventType, str] = {
-    "thinking":       "💭",
-    "tool_call":      "●",
+    "thinking":       "~",
+    "tool_call":      ">",
     "tool_result":    " ",
-    "progress":       "●",
-    "need_approval":  "⚠",
-    "reflection":     "🧠",
-    "done":           "✅",
+    "progress":       ".",
+    "need_approval":  "!",
+    "reflection":     "*",
+    "done":           "+",
 }
 
 

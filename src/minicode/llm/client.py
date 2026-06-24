@@ -2,6 +2,10 @@
 
 DeepSeekLLMClient: 通过 httpx 调用 api.deepseek.com/v1 (OpenAI-compatible)
 MockLLMClient: 返回固定响应用于测试
+
+异常体系:
+- LLMError: 所有 LLM 调用失败的基类（超时/HTTP错误/JSON解析失败）
+- 调用方必须捕获 LLMError 并降级处理
 """
 
 import json
@@ -11,11 +15,31 @@ from dataclasses import dataclass
 import httpx
 
 
+# ── 异常 ──
+
+
+class LLMError(Exception):
+    """LLM 调用失败。
+
+    Attributes:
+        message: 人类可读错误描述
+        cause: 原始异常（如有）
+    """
+
+    def __init__(self, message: str, cause: Exception | None = None):
+        super().__init__(message)
+        self.message = message
+        self.cause = cause
+
+
+# ── 响应 ──
+
+
 @dataclass
 class LLMResponse:
-    """LLM 返回结果。"""
+    """LLM 成功返回结果。"""
     content: str
-    model: str = "mock"
+    model: str = "unknown"
     prompt_tokens: int = 0
     completion_tokens: int = 0
 
@@ -27,6 +51,7 @@ class DeepSeekLLMClient:
     """DeepSeek API 客户端 (OpenAI-compatible 协议)。
 
     API key 从环境变量 `deepseek` 读取。
+    所有网络/API/解析异常均抛出 LLMError。
     """
 
     def __init__(
@@ -36,7 +61,6 @@ class DeepSeekLLMClient:
     ):
         self.api_key = api_key or os.environ.get("deepseek", "")
         self.base_url = base_url.rstrip("/")
-        # 分层超时：连接 10s，读取 30s，总计不超 60s
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=10.0)
         )
@@ -57,13 +81,13 @@ class DeepSeekLLMClient:
             max_tokens: 最大输出 token
 
         Returns:
-            LLMResponse: 解析后的响应（错误时返回包含错误信息的 LLMResponse）
+            LLMResponse: 解析后的响应
+
+        Raises:
+            LLMError: 任何调用失败（超时/HTTP错误/JSON异常）
         """
         if not self.api_key:
-            return LLMResponse(
-                content="[DeepSeek] 未设置 API key (环境变量 deepseek)",
-                model="deepseek-chat",
-            )
+            raise LLMError("未设置 API key (环境变量 deepseek)")
 
         url = f"{self.base_url}/chat/completions"
         headers = {
@@ -81,38 +105,31 @@ class DeepSeekLLMClient:
             resp = await self._client.post(url, headers=headers, json=body)
             resp.raise_for_status()
             data = resp.json()
+        except httpx.TimeoutException as e:
+            raise LLMError("请求超时，请检查网络或稍后重试", cause=e) from e
+        except httpx.HTTPStatusError as e:
+            detail = e.response.text[:300] if e.response is not None else "无详情"
+            raise LLMError(f"API 错误 {e.response.status_code}: {detail}", cause=e) from e
+        except httpx.RequestError as e:
+            raise LLMError(f"网络请求失败: {e}", cause=e) from e
+        except json.JSONDecodeError as e:
+            raise LLMError("API 返回非 JSON 响应", cause=e) from e
 
-            if "choices" not in data or not data["choices"]:
-                return LLMResponse(
-                    content=f"[DeepSeek] API 返回无 choices: {json.dumps(data)[:200]}",
-                    model=model,
-                )
+        # 校验响应结构
+        if "choices" not in data or not data["choices"]:
+            raise LLMError(f"API 返回无 choices: {json.dumps(data)[:200]}")
 
+        try:
             choice = data["choices"][0]
             usage = data.get("usage", {})
-
             return LLMResponse(
                 content=choice["message"]["content"],
                 model=data.get("model", model),
                 prompt_tokens=usage.get("prompt_tokens", 0),
                 completion_tokens=usage.get("completion_tokens", 0),
             )
-
-        except httpx.TimeoutException:
-            return LLMResponse(
-                content="[DeepSeek] 请求超时，请检查网络或稍后重试",
-                model=model,
-            )
-        except httpx.HTTPStatusError as e:
-            return LLMResponse(
-                content=f"[DeepSeek] API 错误 {e.response.status_code}: {e.response.text[:200]}",
-                model=model,
-            )
-        except (httpx.RequestError, json.JSONDecodeError, KeyError) as e:
-            return LLMResponse(
-                content=f"[DeepSeek] 请求失败: {type(e).__name__}: {str(e)[:200]}",
-                model=model,
-            )
+        except (KeyError, TypeError) as e:
+            raise LLMError(f"API 响应结构异常: {e}", cause=e) from e
 
     async def chat_stream(
         self,
@@ -123,10 +140,12 @@ class DeepSeekLLMClient:
 
         Yields:
             str: 每个 token
+
+        Raises:
+            LLMError: 调用失败
         """
         if not self.api_key:
-            yield "[DeepSeek] 未设置 API key"
-            return
+            raise LLMError("未设置 API key (环境变量 deepseek)")
 
         url = f"{self.base_url}/chat/completions"
         headers = {
@@ -157,10 +176,13 @@ class DeepSeekLLMClient:
                                 yield content
                         except (json.JSONDecodeError, KeyError, IndexError):
                             continue
-        except httpx.TimeoutException:
-            yield "[DeepSeek] 流式请求超时"
-        except (httpx.RequestError, httpx.HTTPStatusError) as e:
-            yield f"[DeepSeek] 流式请求失败: {e}"
+        except httpx.TimeoutException as e:
+            raise LLMError("流式请求超时", cause=e) from e
+        except httpx.HTTPStatusError as e:
+            detail = e.response.text[:300] if e.response is not None else "无详情"
+            raise LLMError(f"流式 API 错误 {e.response.status_code}: {detail}", cause=e) from e
+        except httpx.RequestError as e:
+            raise LLMError(f"流式网络请求失败: {e}", cause=e) from e
 
     async def close(self):
         """关闭 HTTP 客户端。"""
@@ -171,7 +193,10 @@ class DeepSeekLLMClient:
 
 
 class MockLLMClient:
-    """Mock LLM 客户端 — 测试和离线模式使用。"""
+    """Mock LLM 客户端 — 测试和离线模式使用。
+
+    Mock 不会抛 LLMError，总是返回固定成功响应。
+    """
 
     async def chat(
         self,
@@ -181,7 +206,7 @@ class MockLLMClient:
         max_tokens: int = 4096,
     ) -> LLMResponse:
         return LLMResponse(
-            content="[Mock LLM] 分析完成，建议继续执行。",
+            content='{"done": true, "reasoning": "Mock: 任务完成"}',
             model=model or "mock-model",
             prompt_tokens=len(str(messages)) // 4,
             completion_tokens=20,
@@ -192,4 +217,8 @@ class MockLLMClient:
         messages: list[dict],
         model: str | None = None,
     ):
-        yield "[Mock LLM stream] 分析中..."
+        yield '{"done": true, "reasoning": "Mock: 任务完成"}'
+
+    async def close(self):
+        """Mock 无需清理。"""
+        pass
