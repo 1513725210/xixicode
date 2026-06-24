@@ -124,6 +124,25 @@ class KeywordPlanner:
             return "create"
         return "explore"
 
+    @staticmethod
+    def _extract_filename(task: str) -> str:
+        """从任务描述中尝试提取文件名。
+
+        策略：匹配常见文件名模式 *.txt, *.py, *.md 等。
+        """
+        import re
+        # 匹配 xxx.xxx 模式的文件名
+        m = re.search(r"([\w\-一-鿿]+\.(?:txt|py|md|json|js|ts|yaml|yml|toml|csv|html|css|sh|bat))", task)
+        if m:
+            return m.group(1)
+        # 匹配 "叫/名为 xxx" 的模式
+        m = re.search(r"(?:叫|名为|命名为?|文件名?[是为]?)\s*[\"']?([^\"'\s]+)", task)
+        if m:
+            name = m.group(1)
+            # 如果有常见扩展名就用，否则默认 .txt
+            return name if "." in name else name + ".txt"
+        return "output.txt"
+
     async def next_step(self, context: LoopContext, system_prompt: str | None = None) -> NextAction:
         """基于关键词和已执行历史返回下一步动作。
 
@@ -142,6 +161,12 @@ class KeywordPlanner:
             return NextAction(done=True, reasoning=f"已完成全部 {len(steps)} 步")
 
         desc, tool, params = steps[idx]
+
+        # 对 create 计划，动态替换文件名
+        if category == "create" and tool == "write_file" and params.get("path") == "output.txt":
+            filename = self._extract_filename(context.task)
+            params = {**params, "path": filename}
+
         return NextAction(
             done=False,
             tool=tool,
