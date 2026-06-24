@@ -63,9 +63,11 @@ class TestEventTypePresence:
 class TestEventOrdering:
     """验证事件按正确的顺序出现。"""
 
-    def test_starts_with_thinking(self, events):
-        """第一个事件应为 thinking。"""
-        assert events[0].type == "thinking", f"第一个事件应为 thinking，实际为 {events[0].type}"
+    def test_starts_with_user_or_thinking(self, events):
+        """第一个事件应为 user（用户输入）或 thinking。"""
+        assert events[0].type in ("user", "thinking"), (
+            f"第一个事件应为 user 或 thinking，实际为 {events[0].type}"
+        )
 
     def test_ends_with_done(self, events):
         """最后一个事件应为 done。"""

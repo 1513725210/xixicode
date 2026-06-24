@@ -60,11 +60,11 @@
 - [x] 1.5 `loop.py` 调用 `save_event()` + CLI 增加 `/resume`
 
 ### Phase 2 — 完善 PARTIAL 功能
-- [ ] 2.1 events.py 增加 `user`/`assistant`/`summary` 类型
-- [ ] 2.2 `tool/storage.py` — 大结果 preview+path 替换
+- [x] 2.1 events.py 增加 `user`/`assistant`/`summary` 类型
+- [x] 2.2 `tool/storage.py` — 大结果 preview+path 替换
 - [ ] 2.3 TUI 升级 — Rich Live 持久面板
-- [ ] 2.4 `tool/background.py` — 后台任务注册表
-- [ ] 2.5 修复 REASONIX.md 与 spec.md 的矛盾
+- [x] 2.4 `tool/background.py` — 后台任务注册表
+- [x] 2.5 修复 REASONIX.md 与 spec.md 的矛盾
 
 ### Phase 3 — MCP 动态能力
 - [ ] 3.1 `mcp/client.py` — stdio JSON-RPC 通信

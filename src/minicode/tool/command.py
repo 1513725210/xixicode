@@ -2,7 +2,7 @@
 
 import asyncio
 
-from minicode.tool.base import Tool, ToolResult
+from minicode.tool.base import Tool, ToolResult, BackgroundTask
 
 
 class RunCommand(Tool):
@@ -33,11 +33,41 @@ class RunCommand(Tool):
         """
         if not command or not command.strip():
             return ToolResult(
-                success=False,
-                output="",
-                error="命令为空",
+                ok=False, output="", error="命令为空",
             )
 
+        trimmed = command.strip()
+
+        # ── 后台任务检测（参考 MiniCode run-command.ts:141-152）──
+        is_background = trimmed.endswith("&") and "&&" not in trimmed
+        if is_background:
+            clean_cmd = trimmed.rstrip("&").strip()
+            try:
+                proc = await asyncio.create_subprocess_shell(
+                    clean_cmd,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                # 注册后台任务
+                from minicode.tool.background import get_registry
+                task = get_registry().register(command=clean_cmd, pid=proc.pid or -1)
+                return ToolResult(
+                    ok=True,
+                    output=f"后台命令已启动\nTASK: {task.task_id}\nPID: {task.pid}",
+                    backgroundTask=BackgroundTask(
+                        task_id=task.task_id,
+                        command=clean_cmd,
+                        pid=task.pid,
+                        started_at=task.started_at,
+                    ),
+                )
+            except OSError as exc:
+                return ToolResult(
+                    ok=False, output="",
+                    error=f"后台命令启动失败: {command[:80]} ({exc})",
+                )
+
+        # ── 同步执行 ──
         try:
             proc = await asyncio.create_subprocess_shell(
                 command,

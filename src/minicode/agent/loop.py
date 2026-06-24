@@ -67,6 +67,13 @@ class QueryLoop:
         self.step_count = 0
         self.tool_count = 0
 
+        # ── 用户输入事件 ──
+        yield AgentEvent(
+            type="user",
+            message=task,
+            detail={"phase": "input"},
+        )
+
         # ── 注入检测（Security Layer 2）──
         try:
             from minicode.security.injection import detect_injection
@@ -366,13 +373,14 @@ class QueryLoop:
                     if est_tokens > 2000:
                         compressed = compress_to_L2(history_text, task)
                         yield AgentEvent(
-                            type="progress",
-                            message=f"上下文压缩: {est_tokens} → ~{compressed.compressed_tokens} tokens",
+                            type="summary",
+                            message=compressed.summary[:200],
                             detail={
                                 "phase": "compaction",
                                 "pre_tokens": est_tokens,
                                 "post_tokens": compressed.compressed_tokens,
                                 "level": compressed.level,
+                                "full_summary": compressed.summary,
                             },
                         )
                 except Exception:
@@ -397,6 +405,16 @@ class QueryLoop:
             summary = await self.planner.synthesize(context)
         except Exception:
             summary = f"任务完成 · {self.step_count} 步 · {self.tool_count} Tool"
+
+        # ── assistant 事件: Agent 最终自然语言回复 ──
+        yield AgentEvent(
+            type="assistant",
+            message=summary[:200],
+            detail={
+                "phase": "final_response",
+                "full_response": summary,
+            },
+        )
 
         yield AgentEvent(
             type="done",
